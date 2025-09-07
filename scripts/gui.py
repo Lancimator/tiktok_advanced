@@ -11,6 +11,8 @@ from tkinter import ttk, messagebox
 SIM_TYPES = [
     ("bouncy", "Bouncy Reveal (simple)"),
     ("three_hit", "3-Hit Rings + Freeze (balls stack)"),
+    ("duo", "Dual Ball Bouncy (balls collide)"),
+    ("duo_freeze", "Dual Ball + Freeze (stacking)"),
     # Future options can be added here, e.g. ("spiral", "Spiral Reveal"), ...
 ]
 
@@ -93,10 +95,24 @@ class App(tk.Tk):
         # Three-hit settings
         frm_opts = ttk.Frame(self)
         frm_opts.pack(fill=tk.X, **pad)
-        self.ring_lives_label = ttk.Label(frm_opts, text="Ring lives (for 3-hit mode):")
+        self.ring_lives_label = ttk.Label(frm_opts, text="Ring lives:")
         self.ring_lives_label.pack(side=tk.LEFT)
         self.ring_lives_entry = ttk.Spinbox(frm_opts, from_=1, to=20, textvariable=self.ring_lives_var, width=6)
         self.ring_lives_entry.pack(side=tk.LEFT, padx=8)
+
+        # Mode options
+        frm_mode = ttk.Labelframe(self, text="Mode options")
+        frm_mode.pack(fill=tk.X, **pad)
+        # Amount of balls (for duo/duo_freeze)
+        ttk.Label(frm_mode, text="Amount of balls:").grid(row=0, column=0, sticky=tk.W)
+        self.balls_count_var = tk.StringVar(value="2")
+        self.balls_count_entry = ttk.Spinbox(frm_mode, from_=1, to=20, textvariable=self.balls_count_var, width=6)
+        self.balls_count_entry.grid(row=0, column=1, sticky=tk.W, padx=8)
+        # Ball life seconds (for bouncy/three_hit/duo_freeze)
+        ttk.Label(frm_mode, text="Ball life (seconds):").grid(row=1, column=0, sticky=tk.W)
+        self.ball_life_var = tk.StringVar(value="2.0")
+        self.ball_life_entry = ttk.Spinbox(frm_mode, from_=0.5, to=30.0, increment=0.5, textvariable=self.ball_life_var, width=6)
+        self.ball_life_entry.grid(row=1, column=1, sticky=tk.W, padx=8)
 
         # Controls
         frm_ctrl = ttk.Frame(self)
@@ -123,6 +139,12 @@ class App(tk.Tk):
             # Fallback for older Tk versions
             self.fully_random_var.trace("w", lambda *args: self._update_random_state())
         self._update_random_state()
+        # Also watch mode checkboxes to update which options to enable
+        for var in self.type_vars.values():
+            try:
+                var.trace_add("write", lambda *args: self._update_random_state())
+            except Exception:
+                var.trace("w", lambda *args: self._update_random_state())
 
     def _log(self, msg: str):
         self.log.insert(tk.END, msg + "\n")
@@ -158,6 +180,13 @@ class App(tk.Tk):
         except Exception:
             pass
         self.ring_lives_entry.configure(state=("disabled" if fr else "normal"))
+        # Grey out/enable mode specifics based on selection
+        sel = [k for k, v in self.type_vars.items() if v.get()]
+        any_duo = any(k in ("duo", "duo_freeze") for k in sel)
+        any_life = any(k in ("bouncy", "three_hit", "duo_freeze") for k in sel)
+        # When fully random, disable all; else enable per rules
+        self.balls_count_entry.configure(state=("disabled" if fr or not any_duo else "normal"))
+        self.ball_life_entry.configure(state=("disabled" if fr or not any_life else "normal"))
 
     def on_start(self):
         # Validate inputs
@@ -210,26 +239,41 @@ class App(tk.Tk):
                 t = random.choice(available)
                 ring_lives_i = random.randint(1, 5)
                 ball_life_i = round(random.uniform(3.0, 10.0), 2)
+                # default initial balls for duo modes under fully random
+                balls_count_i = 2
             else:
                 t = random.choice(types)
                 ring_lives_i = ring_lives
                 ball_life_i = None
+                try:
+                    ball_life_i = float(self.ball_life_var.get())
+                except Exception:
+                    pass
+                try:
+                    balls_count_i = max(1, int(self.balls_count_var.get()))
+                except Exception:
+                    balls_count_i = 2
             label = next((lbl for k, lbl in SIM_TYPES if k == t), t)
             if fully_random:
                 self.msg_q.put(("log", f"[{i+1}/{count}] Running simulation: {label} (ring lives={ring_lives_i}, ball life={ball_life_i}s)"))
             else:
-                self.msg_q.put(("log", f"[{i+1}/{count}] Running simulation: {label} (ring lives={ring_lives_i})"))
+                if t in {"duo", "duo_freeze"}:
+                    self.msg_q.put(("log", f"[{i+1}/{count}] Running simulation: {label} (ring lives={ring_lives_i}, balls={balls_count_i}, ball life={ball_life_i if ball_life_i is not None else '-'}s)"))
+                else:
+                    self.msg_q.put(("log", f"[{i+1}/{count}] Running simulation: {label} (ring lives={ring_lives_i}, ball life={ball_life_i if ball_life_i is not None else '-'}s)"))
 
             # Build command for selected mode
-            if t in {"bouncy", "three_hit"}:
+            if t in {"bouncy", "three_hit", "duo", "duo_freeze"}:
                 cmd = [
                     py, os.path.join("scripts", "sim_reveal.py"),
                     videos_dir, out_dir,
                     "--mode", t,
                     "--ring-lives", str(ring_lives_i),
                 ]
-                if fully_random and ball_life_i is not None:
+                if ball_life_i is not None:
                     cmd += ["--ball-life", str(ball_life_i)]
+                if t in {"duo", "duo_freeze"} and balls_count_i is not None:
+                    cmd += ["--balls", str(balls_count_i)]
             else:
                 # Fallback
                 cmd = [py, os.path.join("scripts", "sim_reveal.py"), videos_dir, out_dir]

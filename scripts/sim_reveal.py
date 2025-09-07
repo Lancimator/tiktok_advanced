@@ -222,12 +222,14 @@ def main():
     parser = argparse.ArgumentParser(description="Simulated reveal generator")
     parser.add_argument("videos_dir", nargs="?", default="videos")
     parser.add_argument("out_dir", nargs="?", default="finished")
-    parser.add_argument("--mode", choices=["bouncy", "three_hit"], default="bouncy",
-                        help="bouncy: simple single-ball; three_hit: balls freeze/respawn and collide with frozen balls. Ring lives apply in both modes.")
+    parser.add_argument("--mode", choices=["bouncy", "three_hit", "duo", "duo_freeze"], default="bouncy",
+                        help="bouncy: simple single-ball; three_hit: balls freeze/respawn and collide with frozen balls; duo: two balls bouncing and colliding; duo_freeze: two balls that periodically freeze and new actives spawn. Ring lives apply in all modes.")
     parser.add_argument("--ring-lives", type=int, default=3,
                         help="Number of hits required to destroy a ring in three_hit mode (default: 3)")
     parser.add_argument("--ball-life", type=float, default=2.0,
                         help="How long the active ball lives in seconds before freeze/relaunch (default: 2.0; used in three_hit to freeze and in bouncy to relaunch)")
+    parser.add_argument("--balls", type=int, default=2,
+                        help="Initial number of active balls in duo/duo_freeze modes (default: 2)")
     args = parser.parse_args()
 
     videos_dir = args.videos_dir
@@ -235,6 +237,7 @@ def main():
     mode = args.mode
     ring_lives = max(1, int(args.ring_lives))
     ball_life_seconds = max(0.5, float(args.ball_life))
+    balls_count = max(1, int(args.balls))
     os.makedirs(out_dir, exist_ok=True)
 
     # Pick a random source video
@@ -319,8 +322,344 @@ def main():
     freeze_seconds = float(ball_life_seconds)
     ball_elapsed = 0.0
 
-    # Phase 1: simulate rings + ball on top of frozen first frame
+    # Phase 1: simulate rings + ball(s) on top of frozen first frame
     frames_written = 0
+
+    # Special mode: duo balls always bouncing (and can grow via spawn rule)
+    if mode == "duo":
+        # Initialize N active balls (default 2)
+        n0 = max(1, int(balls_count))
+        active_pos: List[np.ndarray] = [np.array([center[0], center[1]], dtype=np.float32) for _ in range(n0)]
+        base_ang = float(rng.uniform(0, 2*np.pi))
+        active_vel: List[np.ndarray] = []
+        for i in range(n0):
+            ang = float(base_ang + i * (2*np.pi / max(1, n0)))
+            active_vel.append(np.array([np.cos(ang), np.sin(ang)], dtype=np.float32) * init_speed)
+        trails: List[list] = [[] for _ in range(n0)]
+
+        while mask_alpha > REVEAL_EPS:
+            base = frozen_bg.copy()
+
+            # Apply black mask with current opacity
+            if mask_alpha > 0:
+                base = (base.astype(np.float32) * (1.0 - mask_alpha)).astype(np.uint8)
+
+            # Slight shrink for remaining rings for tension
+            rings_alive = [max(inner_r, r - shrink_per_frame) for r in rings_alive]
+
+            # Draw remaining rings
+            draw_rings(base, center, [int(r) for r in rings_alive])
+
+            # Integrate balls with semi-implicit Euler and simple collision handling
+            base_substeps = 6
+            max_speed = max(float(np.linalg.norm(v)) for v in active_vel) if active_vel else 0.0
+            max_disp = max(2.0, ball_radius * 0.8)
+            adapt = int(np.ceil(max_speed / max_disp)) if max_disp > 0 else base_substeps
+            substeps = int(max(base_substeps, min(24, adapt)))
+            dt = 1.0 / substeps
+            for k in range(substeps):
+                # advance velocities and positions
+                for i in range(len(active_pos)):
+                    active_vel[i] = (active_vel[i] + g * dt + rng.normal(0.0, substep_noise_std, size=2).astype(np.float32)) * air_drag
+                    active_pos[i] = active_pos[i] + active_vel[i] * dt
+
+                # Collide with rings via penetration correction
+                for i in range(len(active_pos)):
+                    p = active_pos[i]
+                    d_vec = np.array([p[0] - center[0], p[1] - center[1]], dtype=np.float32)
+                    dist = float(np.linalg.norm(d_vec))
+                    n_dir = d_vec / (dist + 1e-6) if dist > 1e-6 else np.array([1.0, 0.0], dtype=np.float32)
+                    hit_any = False
+                    for j, rr in enumerate(rings_alive):
+                        band_in = max(1.0, rr - ball_radius)
+                        band_out = rr + ball_radius
+                        if band_in < dist < band_out:
+                            d_out = band_out - dist
+                            d_in = dist - band_in
+                            if d_out <= d_in:
+                                active_pos[i] = active_pos[i] + n_dir * (d_out + 0.5)
+                            else:
+                                active_pos[i] = active_pos[i] - n_dir * (d_in + 0.5)
+                            active_vel[i] = reflect(active_vel[i], n_dir) * 0.985
+
+                            # Event time approximation
+                            t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
+                            bounce_events.append(float(t_event))
+                            # Particles on impact
+                            particles.spawn((int(active_pos[i][0]), int(active_pos[i][1])), n_dir, rng, count=40)
+
+                            # Apply per-ring cooldown and lives
+                            if (t_event - ring_last_hit[j]) >= ring_hit_cooldown_sec:
+                                ring_last_hit[j] = t_event
+                                ring_hits[j] += 1
+                                if ring_hits[j] >= ring_lives:
+                                    rings_alive.pop(j)
+                                    ring_hits.pop(j)
+                                    ring_last_hit.pop(j)
+                                    mask_alpha = max(0.0, mask_alpha - 0.10)
+                                    boom_events.append(float(t_event))
+                                    last_destroy_t = float(t_event)
+                                    if not rings_alive or mask_alpha <= REVEAL_EPS:
+                                        mask_alpha = 0.0
+                            hit_any = True
+                            break
+
+                # Ball-ball collisions (equal mass elastic, simple separation)
+                nballs = len(active_pos)
+                if nballs >= 2:
+                    for i in range(nballs):
+                        for j in range(i + 1, nballs):
+                            delta = active_pos[i] - active_pos[j]
+                            dist = float(np.linalg.norm(delta))
+                            min_sep = float(2 * ball_radius)
+                            if dist < min_sep - 0.25:
+                                n = delta / (dist + 1e-6)
+                                overlap = min_sep - dist
+                                # separate equally
+                                active_pos[i] = active_pos[i] + n * (overlap * 0.5 + 0.25)
+                                active_pos[j] = active_pos[j] - n * (overlap * 0.5 + 0.25)
+                                # relative velocity along normal
+                                rv = active_vel[i] - active_vel[j]
+                                reln = float(np.dot(rv, n))
+                                if reln < 0.0:
+                                    active_vel[i] = active_vel[i] - n * reln
+                                    active_vel[j] = active_vel[j] + n * reln
+                                    # small restitution randomness
+                                    rest = float(rng.uniform(*restitution_range))
+                                    active_vel[i] *= rest
+                                    active_vel[j] *= rest
+                                # record bounce event
+                                t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
+                                bounce_events.append(float(t_event))
+
+            # Draw effects
+            for i in range(len(active_pos)):
+                trails[i].append((active_pos[i][0], active_pos[i][1]))
+                if len(trails[i]) > trail_max:
+                    trails[i] = trails[i][-trail_max:]
+                draw_trail(base, trails[i])
+            particles.step()
+            particles.draw(base)
+
+            # Draw balls last
+            for p in active_pos:
+                cx, cy = int(p[0]), int(p[1])
+                cv2.circle(base, (cx, cy), ball_radius, ball_color, thickness=-1, lineType=cv2.LINE_AA)
+                cv2.circle(base, (cx, cy), ball_radius, (255, 255, 255), thickness=2, lineType=cv2.LINE_AA)
+
+            # Progress bar
+            reveal_pct = int(round((1.0 - mask_alpha) * 100))
+            bar_w = int(target_w * 0.7)
+            bar_h = 16
+            x0 = (target_w - bar_w) // 2
+            y0 = 40
+            cv2.rectangle(base, (x0, y0), (x0 + bar_w, y0 + bar_h), (60, 60, 60), -1, lineType=cv2.LINE_AA)
+            filled = int(bar_w * reveal_pct / 100)
+            cv2.rectangle(base, (x0, y0), (x0 + filled, y0 + bar_h), (60, 220, 130), -1, lineType=cv2.LINE_AA)
+            cv2.putText(base, f"Reveal {reveal_pct}%", (x0, y0 + bar_h + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240, 240, 240), 2, cv2.LINE_AA)
+
+            writer.write(base)
+            frames_written += 1
+
+            # Spawn a new active ball if no ring destroyed for 10s
+            sim_t = frames_written / float(fps)
+            if (sim_t - last_destroy_t) >= 10.0:
+                active_pos.append(np.array([center[0], center[1]], dtype=np.float32))
+                ang = float(rng.uniform(0, 2*np.pi))
+                active_vel.append(np.array([np.cos(ang), np.sin(ang)], dtype=np.float32) * init_speed)
+                trails.append([])
+                last_destroy_t = float(sim_t)
+
+            # Safety: avoid overly long pre-phase
+            if frames_written > fps * 45:
+                mask_alpha = 0.0
+
+        # set mask_alpha to 0 ensures the default loop below is skipped
+        # and continue to phase 2
+
+    # Special mode: duo_freeze — two balls that freeze after a while (stack), bounce off frozen
+    if mode == "duo_freeze":
+        n0 = max(1, int(balls_count))
+        active_pos: List[np.ndarray] = [np.array([center[0], center[1]], dtype=np.float32) for _ in range(n0)]
+        base_ang = float(rng.uniform(0, 2*np.pi))
+        active_vel: List[np.ndarray] = []
+        for i in range(n0):
+            ang = float(base_ang + i * (2*np.pi / max(1, n0)))
+            active_vel.append(np.array([np.cos(ang), np.sin(ang)], dtype=np.float32) * init_speed)
+        trails: List[list] = [[] for _ in range(n0)]
+        # Per-ball life timers
+        timers: List[float] = [0.0 for _ in range(n0)]
+
+        while mask_alpha > REVEAL_EPS:
+            base = frozen_bg.copy()
+
+            # Apply black mask with current opacity
+            if mask_alpha > 0:
+                base = (base.astype(np.float32) * (1.0 - mask_alpha)).astype(np.uint8)
+
+            # Slight shrink for remaining rings for tension
+            rings_alive = [max(inner_r, r - shrink_per_frame) for r in rings_alive]
+
+            # Draw remaining rings
+            draw_rings(base, center, [int(r) for r in rings_alive])
+
+            # Integrate balls
+            base_substeps = 6
+            max_speed = max(float(np.linalg.norm(v)) for v in active_vel) if active_vel else 0.0
+            max_disp = max(2.0, ball_radius * 0.8)
+            adapt = int(np.ceil(max_speed / max_disp)) if max_disp > 0 else base_substeps
+            substeps = int(max(base_substeps, min(24, adapt)))
+            dt = 1.0 / substeps
+            for k in range(substeps):
+                # advance velocities and positions
+                for i in range(len(active_pos)):
+                    active_vel[i] = (active_vel[i] + g * dt + rng.normal(0.0, substep_noise_std, size=2).astype(np.float32)) * air_drag
+                    active_pos[i] = active_pos[i] + active_vel[i] * dt
+
+                # Collide active balls with rings (penetration correction)
+                for i in range(len(active_pos)):
+                    p = active_pos[i]
+                    d_vec = np.array([p[0] - center[0], p[1] - center[1]], dtype=np.float32)
+                    dist = float(np.linalg.norm(d_vec))
+                    n_dir = d_vec / (dist + 1e-6) if dist > 1e-6 else np.array([1.0, 0.0], dtype=np.float32)
+                    for j, rr in enumerate(rings_alive):
+                        band_in = max(1.0, rr - ball_radius)
+                        band_out = rr + ball_radius
+                        if band_in < dist < band_out:
+                            d_out = band_out - dist
+                            d_in = dist - band_in
+                            if d_out <= d_in:
+                                active_pos[i] = active_pos[i] + n_dir * (d_out + 0.5)
+                            else:
+                                active_pos[i] = active_pos[i] - n_dir * (d_in + 0.5)
+                            active_vel[i] = reflect(active_vel[i], n_dir) * 0.985
+                            # Event time approximation
+                            t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
+                            bounce_events.append(float(t_event))
+                            particles.spawn((int(active_pos[i][0]), int(active_pos[i][1])), n_dir, rng, count=40)
+                            # Ring lives + cooldown
+                            if (t_event - ring_last_hit[j]) >= ring_hit_cooldown_sec:
+                                ring_last_hit[j] = t_event
+                                ring_hits[j] += 1
+                                if ring_hits[j] >= ring_lives:
+                                    rings_alive.pop(j)
+                                    ring_hits.pop(j)
+                                    ring_last_hit.pop(j)
+                                    mask_alpha = max(0.0, mask_alpha - 0.10)
+                                    boom_events.append(float(t_event))
+                                    last_destroy_t = float(t_event)
+                                    if not rings_alive or mask_alpha <= REVEAL_EPS:
+                                        mask_alpha = 0.0
+                            break
+
+                # Collide active balls with frozen balls
+                if frozen_balls:
+                    for i in range(len(active_pos)):
+                        for fb in frozen_balls:
+                            delta = active_pos[i] - fb
+                            dist = float(np.linalg.norm(delta))
+                            min_sep = float(2 * ball_radius)
+                            if dist < min_sep - 0.25:
+                                n = delta / (dist + 1e-6)
+                                active_pos[i] = active_pos[i] + n * (min_sep - dist + 0.5)
+                                active_vel[i] = reflect(active_vel[i], n) * 0.985
+                                t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
+                                bounce_events.append(float(t_event))
+
+                # Collide active balls with each other (elastic)
+                nballs = len(active_pos)
+                if nballs >= 2:
+                    for i in range(nballs):
+                        for j in range(i + 1, nballs):
+                            delta = active_pos[i] - active_pos[j]
+                            dist = float(np.linalg.norm(delta))
+                            min_sep = float(2 * ball_radius)
+                            if dist < min_sep - 0.25:
+                                n = delta / (dist + 1e-6)
+                                overlap = min_sep - dist
+                                active_pos[i] = active_pos[i] + n * (overlap * 0.5 + 0.25)
+                                active_pos[j] = active_pos[j] - n * (overlap * 0.5 + 0.25)
+                                rv = active_vel[i] - active_vel[j]
+                                reln = float(np.dot(rv, n))
+                                if reln < 0.0:
+                                    active_vel[i] = active_vel[i] - n * reln
+                                    active_vel[j] = active_vel[j] + n * reln
+                                    rest = float(rng.uniform(*restitution_range))
+                                    active_vel[i] *= rest
+                                    active_vel[j] *= rest
+                                t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
+                                bounce_events.append(float(t_event))
+
+            # Draw effects
+            for i in range(len(active_pos)):
+                trails[i].append((active_pos[i][0], active_pos[i][1]))
+                if len(trails[i]) > trail_max:
+                    trails[i] = trails[i][-trail_max:]
+                draw_trail(base, trails[i])
+            particles.step()
+            particles.draw(base)
+
+            # Draw frozen balls
+            if frozen_balls:
+                for fb in frozen_balls:
+                    cx, cy = int(fb[0]), int(fb[1])
+                    cv2.circle(base, (cx, cy), ball_radius, (180, 180, 180), thickness=-1, lineType=cv2.LINE_AA)
+                    cv2.circle(base, (cx, cy), ball_radius, (240, 240, 240), thickness=2, lineType=cv2.LINE_AA)
+
+            # Draw active balls last
+            for p in active_pos:
+                cx, cy = int(p[0]), int(p[1])
+                cv2.circle(base, (cx, cy), ball_radius, ball_color, thickness=-1, lineType=cv2.LINE_AA)
+                cv2.circle(base, (cx, cy), ball_radius, (255, 255, 255), thickness=2, lineType=cv2.LINE_AA)
+
+            # Progress bar
+            reveal_pct = int(round((1.0 - mask_alpha) * 100))
+            bar_w = int(target_w * 0.7)
+            bar_h = 16
+            x0 = (target_w - bar_w) // 2
+            y0 = 40
+            cv2.rectangle(base, (x0, y0), (x0 + bar_w, y0 + bar_h), (60, 60, 60), -1, lineType=cv2.LINE_AA)
+            filled = int(bar_w * reveal_pct / 100)
+            cv2.rectangle(base, (x0, y0), (x0 + filled, y0 + bar_h), (60, 220, 130), -1, lineType=cv2.LINE_AA)
+            cv2.putText(base, f"Reveal {reveal_pct}%", (x0, y0 + bar_h + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240, 240, 240), 2, cv2.LINE_AA)
+
+            writer.write(base)
+            frames_written += 1
+
+            # Advance per-ball timers and freeze those exceeding life
+            for i in range(len(timers)):
+                timers[i] += (1.0 / fps)
+            # Freeze-and-respawn pass (iterate reverse to pop safely)
+            i = len(active_pos) - 1
+            while i >= 0:
+                if timers[i] >= freeze_seconds:
+                    frozen_balls.append(active_pos[i].copy())
+                    # spawn new active at center
+                    active_pos[i] = np.array([center[0], center[1]], dtype=np.float32)
+                    ang = float(rng.uniform(0, 2*np.pi))
+                    active_vel[i] = np.array([np.cos(ang), np.sin(ang)], dtype=np.float32) * init_speed
+                    timers[i] = 0.0
+                    trails[i] = []
+                i -= 1
+
+            # Spawn an extra active ball if no ring destroyed for 10s
+            sim_t = frames_written / float(fps)
+            if (sim_t - last_destroy_t) >= 10.0:
+                active_pos.append(np.array([center[0], center[1]], dtype=np.float32))
+                ang = float(rng.uniform(0, 2*np.pi))
+                active_vel.append(np.array([np.cos(ang), np.sin(ang)], dtype=np.float32) * init_speed)
+                trails.append([])
+                timers.append(0.0)
+                last_destroy_t = float(sim_t)
+
+            # Safety: avoid overly long pre-phase
+            if frames_written > fps * 45:
+                mask_alpha = 0.0
+
+        # set mask_alpha to 0 ensures the default loop below is skipped
+        # and continue to phase 2
+
+    # Default single-ball/three_hit simulation
     while mask_alpha > REVEAL_EPS:
         base = frozen_bg.copy()
 
