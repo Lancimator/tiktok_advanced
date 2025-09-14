@@ -54,59 +54,130 @@ def reflect(vel: np.ndarray, normal: np.ndarray) -> np.ndarray:
     return vel - 2.0 * np.dot(vel, normal) * normal
 
 
-def synth_combined_audio(bounce_times: List[float], boom_times: List[float], total_duration_sec: float, out_wav: str,
-                        sample_rate: int = 44100) -> None:
-    """Render short beeps at bounce_times and explosion-like booms at boom_times, mix, and save WAV."""
+def synth_combined_audio(
+    bounce_times: List[float],
+    boom_times: List[float],
+    total_duration_sec: float,
+    out_wav: str,
+    sample_rate: int = 44100,
+    other_bounce_times: Optional[List[float]] = None,
+) -> None:
+    """Render softer, less piercing sounds:
+    - Ring bounces: gentle sine beeps whose pitch rises slightly after each ring-bounce
+      since the last ring destroy. On ring destroy, pitch resets to its base.
+    - Other collisions (ball-ball/frozen): quiet ticks.
+    - Ring destroy: lower, soft thump.
+    """
     sr = int(sample_rate)
     n = int(max(0.1, total_duration_sec + 0.5) * sr)
     audio = np.zeros(n, dtype=np.float32)
 
     rng_audio = np.random.default_rng(1337)
 
-    # Bounce: bright short beep
-    beep_dur = 0.085
-    t_beep = np.linspace(0, beep_dur, int(sr * beep_dur), endpoint=False)
-    env_beep = np.exp(-t_beep * 22.0) * np.clip(t_beep / 0.006, 0.0, 1.0)
+    # Prepare lists
+    ring_b = sorted([t for t in (bounce_times or []) if t >= 0.0])
+    boom_t = sorted([t for t in (boom_times or []) if t >= 0.0])
+    other_b = sorted([t for t in (other_bounce_times or []) if t >= 0.0])
 
-    for t in bounce_times:
-        if t < 0:
-            continue
-        start = int(t * sr)
+    # Ring bounce: soft sine beep with slight pitch increment per bounce since last boom
+    base_f = 520.0  # Hz
+    step_ratio = 1.06  # ~1/12 octave per bounce (subtle)
+    beep_dur = 0.090
+    t_beep = np.linspace(0, beep_dur, int(sr * beep_dur), endpoint=False)
+    # Softer envelope: 5 ms attack, smooth decay
+    env_beep = np.exp(-t_beep * 16.0) * np.clip(t_beep / 0.005, 0.0, 1.0)
+
+    # Track pitch streak that resets after each boom
+    boom_idx = 0
+    streak = 0
+    for tb in ring_b:
+        # Reset streak if any ring-destroy events occurred before/at tb
+        while boom_idx < len(boom_t) and boom_t[boom_idx] <= tb:
+            streak = 0
+            boom_idx += 1
+
+        start = int(tb * sr)
         if start >= n:
             continue
-        f0 = float(rng_audio.uniform(780.0, 1400.0))
+        # Compute frequency with slight random jitter for naturalness
+        f = base_f * (step_ratio ** streak)
+        f = float(np.clip(f * rng_audio.uniform(0.98, 1.02), 200.0, 1400.0))
         phase = float(rng_audio.uniform(0, 2 * np.pi))
-        glide = np.linspace(0.0, float(rng_audio.uniform(-120.0, 90.0)), t_beep.shape[0], dtype=np.float32)
-        sig = (np.sin(2 * np.pi * (f0 + glide) * t_beep + phase) * env_beep).astype(np.float32)
-        vol = float(0.33 * rng_audio.uniform(0.85, 1.2))
+        # very shallow glide
+        glide = np.linspace(0.0, float(rng_audio.uniform(-40.0, 30.0)), t_beep.shape[0], dtype=np.float32)
+        sig = (np.sin(2 * np.pi * (f + glide) * t_beep + phase) * env_beep).astype(np.float32)
+        vol = 0.22
         sig *= vol
         end = min(n, start + sig.shape[0])
         audio[start:end] += sig[: end - start]
 
-    # Explosion: noisy low-mid thump with downward chirp
-    boom_dur = 0.22
-    t_boom = np.linspace(0, boom_dur, int(sr * boom_dur), endpoint=False)
-    # envelope: quick attack then slower decay
-    env_boom = np.clip(t_boom / 0.004, 0.0, 1.0) * np.exp(-t_boom * 10.0)
+        streak += 1
 
-    for t in boom_times:
-        if t < 0:
-            continue
+    # Other collisions: very short, subtle tick (filtered noise burst)
+    if other_b:
+        tick_dur = 0.045
+        t_tick = np.linspace(0, tick_dur, int(sr * tick_dur), endpoint=False)
+        env_tick = np.exp(-t_tick * 25.0) * np.clip(t_tick / 0.003, 0.0, 1.0)
+        for t in other_b:
+            start = int(t * sr)
+            if start >= n:
+                continue
+            noise = rng_audio.normal(0.0, 1.0, size=t_tick.shape[0]).astype(np.float32)
+            # cheap highpass-ish by subtracting a smoothed version
+            smooth = np.convolve(noise, np.ones(5)/5.0, mode='same').astype(np.float32)
+            sig = (noise - smooth) * env_tick * 0.06
+            end = min(n, start + sig.shape[0])
+            audio[start:end] += sig[: end - start]
+
+    # Ring destroy: cinematic crack + boom
+    # - Short high-frequency crack at onset
+    # - Deeper downward-sweeping boom body with a bit of lowpass noise
+    boom_dur = 0.32
+    t_boom = np.linspace(0, boom_dur, int(sr * boom_dur), endpoint=False)
+    env_boom = np.clip(t_boom / 0.003, 0.0, 1.0) * np.exp(-t_boom * 6.8)
+
+    crack_dur = 0.040
+    t_crack = np.linspace(0, crack_dur, int(sr * crack_dur), endpoint=False)
+    env_crack = np.clip(t_crack / 0.0015, 0.0, 1.0) * np.exp(-t_crack * 80.0)
+
+    for t in boom_t:
         start = int(t * sr)
         if start >= n:
             continue
-        f_start = float(rng_audio.uniform(650.0, 900.0))
-        f_end = float(rng_audio.uniform(120.0, 220.0))
+
+        # High-frequency crack (band-limited noise burst)
+        crack = rng_audio.normal(0.0, 1.0, size=t_crack.shape[0]).astype(np.float32)
+        # Highpass-ish by subtracting a moving average (remove lows)
+        hp = crack - np.convolve(crack, np.ones(9)/9.0, mode='same').astype(np.float32)
+        sig_crack = hp * env_crack * 0.12
+
+        # Boom body: downward chirp + lowpassed noise + a sub layer
+        f_start = float(rng_audio.uniform(180.0, 240.0))
+        f_end = float(rng_audio.uniform(70.0, 100.0))
         f = np.linspace(f_start, f_end, t_boom.shape[0], dtype=np.float32)
         phase = 2 * np.pi * np.cumsum(f) / sr
         tone = np.sin(phase)
-        noise = rng_audio.normal(0.0, 0.7, size=t_boom.shape[0]).astype(np.float32)
-        # bandpass-ish by mixing
-        sig = (0.65 * tone + 0.35 * noise) * env_boom
-        vol = float(0.60 * rng_audio.uniform(0.8, 1.1))
-        sig *= vol
-        end = min(n, start + sig.shape[0])
-        audio[start:end] += sig[: end - start]
+
+        # Sub layer (very low sine with slower decay)
+        f_sub = np.linspace(max(40.0, f_end * 0.7), max(35.0, f_end * 0.5), t_boom.shape[0], dtype=np.float32)
+        phase_sub = 2 * np.pi * np.cumsum(f_sub) / sr
+        sub = np.sin(phase_sub)
+
+        # Lowpass noise via moving average
+        lp_noise_src = rng_audio.normal(0.0, 1.0, size=t_boom.shape[0]).astype(np.float32)
+        lp = np.convolve(lp_noise_src, np.ones(13)/13.0, mode='same').astype(np.float32)
+
+        body = (0.55 * tone + 0.25 * lp + 0.20 * sub)
+        sig_body = body * env_boom
+
+        # Gentle saturation to warm up
+        sig = np.tanh((sig_body) * 1.6) * 0.40
+
+        # Mix crack and body
+        end_body = min(n, start + sig.shape[0])
+        audio[start:end_body] += sig[: end_body - start]
+        end_crack = min(n, start + sig_crack.shape[0])
+        audio[start:end_crack] += sig_crack[: end_crack - start]
 
     # prevent clipping
     m = float(np.max(np.abs(audio))) if np.any(audio) else 0.0
@@ -222,12 +293,12 @@ def main():
     parser = argparse.ArgumentParser(description="Simulated reveal generator")
     parser.add_argument("videos_dir", nargs="?", default="videos")
     parser.add_argument("out_dir", nargs="?", default="finished")
-    parser.add_argument("--mode", choices=["bouncy", "three_hit", "duo", "duo_freeze"], default="bouncy",
-                        help="bouncy: simple single-ball; three_hit: balls freeze/respawn and collide with frozen balls; duo: two balls bouncing and colliding; duo_freeze: two balls that periodically freeze and new actives spawn. Ring lives apply in all modes.")
+    parser.add_argument("--mode", choices=["three_hit", "duo", "duo_freeze"], default="three_hit",
+                        help="three_hit: balls freeze/respawn and collide with frozen balls; duo: multiple balls bouncing and colliding; duo_freeze: multiple balls that periodically freeze and new actives spawn. Ring lives apply in all modes.")
     parser.add_argument("--ring-lives", type=int, default=3,
                         help="Number of hits required to destroy a ring in three_hit mode (default: 3)")
     parser.add_argument("--ball-life", type=float, default=2.0,
-                        help="How long the active ball lives in seconds before freeze/relaunch (default: 2.0; used in three_hit to freeze and in bouncy to relaunch)")
+                        help="How long an active ball lives in seconds before freeze/relaunch (default: 2.0; used in three_hit and duo_freeze)")
     parser.add_argument("--balls", type=int, default=2,
                         help="Initial number of active balls in duo/duo_freeze modes (default: 2)")
     args = parser.parse_args()
@@ -313,12 +384,13 @@ def main():
     writer = cv2.VideoWriter(out_path, fourcc, fps, (target_w, target_h))
 
     # Track audio events (seconds) to add sound later
-    bounce_events: List[float] = []
+    ring_bounce_events: List[float] = []  # ring contacts
+    other_bounce_events: List[float] = []  # ball-ball or ball-frozen
     boom_events: List[float] = []
     last_destroy_t: float = 0.0
     # 'three_hit' mode state
     frozen_balls: List[np.ndarray] = []
-    # Ball life (seconds): in three_hit this is freeze time; in bouncy we relaunch after this
+    # Ball life (seconds): in three_hit this is freeze time; in duo_freeze used per active ball
     freeze_seconds = float(ball_life_seconds)
     ball_elapsed = 0.0
 
@@ -384,7 +456,7 @@ def main():
 
                             # Event time approximation
                             t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
-                            bounce_events.append(float(t_event))
+                            ring_bounce_events.append(float(t_event))
                             # Particles on impact
                             particles.spawn((int(active_pos[i][0]), int(active_pos[i][1])), n_dir, rng, count=40)
 
@@ -430,7 +502,7 @@ def main():
                                     active_vel[j] *= rest
                                 # record bounce event
                                 t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
-                                bounce_events.append(float(t_event))
+                                other_bounce_events.append(float(t_event))
 
             # Draw effects
             for i in range(len(active_pos)):
@@ -535,7 +607,7 @@ def main():
                             active_vel[i] = reflect(active_vel[i], n_dir) * 0.985
                             # Event time approximation
                             t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
-                            bounce_events.append(float(t_event))
+                            ring_bounce_events.append(float(t_event))
                             particles.spawn((int(active_pos[i][0]), int(active_pos[i][1])), n_dir, rng, count=40)
                             # Ring lives + cooldown
                             if (t_event - ring_last_hit[j]) >= ring_hit_cooldown_sec:
@@ -564,7 +636,7 @@ def main():
                                 active_pos[i] = active_pos[i] + n * (min_sep - dist + 0.5)
                                 active_vel[i] = reflect(active_vel[i], n) * 0.985
                                 t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
-                                bounce_events.append(float(t_event))
+                                other_bounce_events.append(float(t_event))
 
                 # Collide active balls with each other (elastic)
                 nballs = len(active_pos)
@@ -588,7 +660,7 @@ def main():
                                     active_vel[i] *= rest
                                     active_vel[j] *= rest
                                 t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
-                                bounce_events.append(float(t_event))
+                                other_bounce_events.append(float(t_event))
 
             # Draw effects
             for i in range(len(active_pos)):
@@ -748,8 +820,8 @@ def main():
                                 vel = reflect(vel, n_dir) * 0.985
                                 # Count a hit with cooldown
                                 t_event = (frames_written / fps) + ((k + 1) / substeps) * (1.0 / fps)
-                                # Record a bounce sound on correction
-                                bounce_events.append(float(t_event))
+                                # Record a bounce sound on correction (ring contact)
+                                ring_bounce_events.append(float(t_event))
                                 if (t_event - ring_last_hit[i]) >= ring_hit_cooldown_sec:
                                     ring_last_hit[i] = t_event
                                     ring_hits[i] += 1
@@ -806,8 +878,11 @@ def main():
                 sub_elapsed = (1.0 - time_left)  # before subtracting earliest_t
                 t_frame = (frames_written / fps)
                 t_event = t_frame + ((k * dt) + (sub_elapsed + earliest_t) * dt) / 1.0 / fps
-                # Record a bounce sound for every collision (ring or frozen ball)
-                bounce_events.append(float(t_event))
+                # Record a bounce sound: distinguish ring vs other
+                if 0 <= hit_index:
+                    ring_bounce_events.append(float(t_event))
+                else:
+                    other_bounce_events.append(float(t_event))
 
                 # Ring touch handling
                 if 0 <= hit_index < len(rings_alive):
@@ -885,14 +960,7 @@ def main():
                 vel = np.array([np.cos(angleN), np.sin(angleN)], dtype=np.float32) * init_speed
                 ball_elapsed = 0.0
                 trail = []
-        else:
-            # In bouncy mode: relaunch after ball life
-            if ball_elapsed >= freeze_seconds:
-                pos = np.array([center[0], center[1]], dtype=np.float32)
-                angleN = float(rng.uniform(0, 2*np.pi))
-                vel = np.array([np.cos(angleN), np.sin(angleN)], dtype=np.float32) * init_speed
-                ball_elapsed = 0.0
-                trail = []
+        
 
         # Spawn a new ball if no ring is destroyed for 10 seconds
         sim_t = frames_written / float(fps)
@@ -905,24 +973,10 @@ def main():
                 vel = np.array([np.cos(angleR), np.sin(angleR)], dtype=np.float32) * init_speed
                 trail = []
                 ball_elapsed = 0.0
-            else:
-                # In bouncy mode, re-center and re-launch the ball
-                pos = np.array([center[0], center[1]], dtype=np.float32)
-                angleR = float(rng.uniform(0, 2*np.pi))
-                vel = np.array([np.cos(angleR), np.sin(angleR)], dtype=np.float32) * init_speed
-                trail = []
-            # Reset the timer window (so we don't spawn every frame)
-            last_destroy_t = float(sim_t)
+                # Reset the timer window (so we don't spawn every frame)
+                last_destroy_t = float(sim_t)
 
-        # End Phase 1 if the ball leaves the visible frame (simulation domain)
-        # Keep early-exit only in bouncy mode to avoid premature finish in three_hit
-        if 'mode' in locals() and mode == "bouncy":
-            exit_margin = 2 * ball_radius
-            if (
-                pos[0] < -exit_margin or pos[0] > target_w + exit_margin or
-                pos[1] < -exit_margin or pos[1] > target_h + exit_margin
-            ):
-                mask_alpha = 0.0
+        # End Phase 1 safety guard
 
         # Safety: avoid overly long pre-phase (fallback guard)
         if frames_written > fps * 45:  # cap phase 1 at ~45s
@@ -951,7 +1005,14 @@ def main():
     total_duration = (frames_written + phase2_frames) / float(fps)
     wav_path = os.path.join(out_dir, f"sim_{ts}_mix.wav")
     try:
-        synth_combined_audio(bounce_events, boom_events, total_duration, wav_path, sample_rate=44100)
+        synth_combined_audio(
+            ring_bounce_events,
+            boom_events,
+            total_duration,
+            wav_path,
+            sample_rate=44100,
+            other_bounce_times=other_bounce_events,
+        )
     except Exception as e:
         wav_path = None
 
