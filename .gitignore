@@ -1,0 +1,12 @@
+videos/*
+!videos/.gitkeep
+
+music/*
+!music/.gitkeep
+
+finished/*
+!finished/.gitkeep
+
+__pycache__/*
+
+simulations/__pycache__/*
