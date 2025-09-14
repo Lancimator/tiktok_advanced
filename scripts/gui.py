@@ -83,13 +83,9 @@ class App(tk.Tk):
             cb.pack(anchor=tk.W, padx=8, pady=2)
             self.type_cbs[key] = cb
 
-        # Fully random option
+        # Fully random option (moved to above Start button). It randomizes mode, ring lives,
+        # ball life, balls count, and future simulation-defining parameters.
         self.fully_random_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm_types,
-            text="Fully Random (type per video + ring lives 1-5)",
-            variable=self.fully_random_var,
-        ).pack(anchor=tk.W, padx=8, pady=2)
 
         # Three-hit settings
         frm_opts = ttk.Frame(self)
@@ -112,6 +108,16 @@ class App(tk.Tk):
         self.ball_life_var = tk.StringVar(value="2.0")
         self.ball_life_entry = ttk.Spinbox(frm_mode, from_=0.5, to=30.0, increment=0.5, textvariable=self.ball_life_var, width=6)
         self.ball_life_entry.grid(row=1, column=1, sticky=tk.W, padx=8)
+
+        # Randomization toggle just above the Start button
+        frm_rand = ttk.Frame(self)
+        frm_rand.pack(fill=tk.X, **pad)
+        self.fully_random_cb = ttk.Checkbutton(
+            frm_rand,
+            text="Fully Random (random mode, ring lives, ball life, balls, etc.)",
+            variable=self.fully_random_var,
+        )
+        self.fully_random_cb.pack(anchor=tk.W)
 
         # Controls
         frm_ctrl = ttk.Frame(self)
@@ -237,9 +243,9 @@ class App(tk.Tk):
                 available = [k for k, _ in SIM_TYPES]
                 t = random.choice(available)
                 ring_lives_i = random.randint(1, 5)
-                ball_life_i = round(random.uniform(3.0, 10.0), 2)
-                # default initial balls for duo modes under fully random
-                balls_count_i = 2
+                ball_life_i = round(random.uniform(2.0, 8.0), 2)
+                # Random initial balls for duo/duo_freeze
+                balls_count_i = random.randint(1, 6)
             else:
                 t = random.choice(types)
                 ring_lives_i = ring_lives
